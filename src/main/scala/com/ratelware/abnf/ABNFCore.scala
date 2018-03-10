@@ -3,6 +3,7 @@ import scala.util.parsing.combinator._
 
 // rules according to Appendix B of RFC5234
 trait ABNFCore extends RegexParsers {
+  override def skipWhitespace: Boolean = false
 
   case class ALPHA(c: String)
   def alpha: Parser[ALPHA] = "[a-zA-Z]".r ^^ (s => ALPHA(s))

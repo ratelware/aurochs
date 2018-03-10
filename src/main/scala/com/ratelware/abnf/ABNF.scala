@@ -1,35 +1,49 @@
 package com.ratelware.abnf
 
+import javax.lang.model.util.Elements
+
 import scala.util.parsing.combinator.RegexParsers
+import scala.language.postfixOps
 
 object ABNF extends ABNFCore {
-  def rulelist = rep1(rule | ((cwsp*) ~ cnl))
-  def rule = rulename ~ defined_as ~ elements ~ cnl
 
-  case class RuleName(name: String)
-  def rulename = alpha ~ rep(alpha | digit | "-") ^^ {
-    case ALPHA(a) ~ b => b.map{
+  case class RuleList(rules: List[Rule], comments: List[List[Option[Comment]]])
+  def rulelist: Parser[RuleList] = rep1(rule ~ ((cwsp *) ~ cnl)) ^^ {
+    rules => RuleList(rules.map(_._1), rules.map(r => r._2._1 ++ List(r._2._2)))
+  }
+
+  case class Rule(name: RuleName, definedAs: DefinedAs, elements: Elements, comment: Option[Comment])
+  def rule: Parser[Rule] = (rulename ~ defined_as ~ elements ~ cnl) ^^ {
+    case name ~ definedAs ~ elements ~ comment => Rule(name, definedAs, elements, comment)
+  }
+
+  case class RuleName(name: String) extends Element
+  def rulename: Parser[RuleName] = alpha ~ rep(alpha | digit | "-") ^^ {
+    case ALPHA(a) ~ b => RuleName(List(a) ++ b.map{
       case ALPHA(c) => c
       case DIGIT(c) => c
       case "-" => "-"
-    } +: a mkString
+    } mkString)
   }
 
   case class DefinedAs(precomments: List[Comment], postcomments: List[Comment], isIncremental: Boolean)
-  def defined_as = (cwsp*) ~ ("=" | "=/") ~ (cwsp*) ^^ {
+  def defined_as: Parser[DefinedAs] = (cwsp*) ~ ("=" | "=/") ~ (cwsp*) ^^ {
     case pre ~ t ~ post => DefinedAs(pre.filter(_.isDefined).map(_.get), post.filter(_.isDefined).map(_.get), t == "=/")
   }
 
-  def elements = alternation ~ (cwsp*)
+  case class Elements(alternation: Alternation, comments: List[Comment])
+  def elements: Parser[Elements] = (alternation ~ (cwsp*)) ^^ {
+    case a ~ comments => Elements(a, comments.flatMap(_.toList))
+  }
 
   def cwsp: Parser[Option[Comment]] = (WSP | (cnl ~ WSP)) ^^ {
-    case c ~ _ => c
+    case (comment: Option[Comment]) ~ _ => comment
     case _ => None
   }
 
   def cnl: Parser[Option[Comment]] = (comment | CRLF) ^^ {
     case a@Comment(c) => Some(a)
-    case (_, _) => None
+    case _ => None
   }
 
   case class Comment(c: String)
@@ -37,33 +51,53 @@ object ABNF extends ABNFCore {
     case _ ~ l ~ _ => Comment(l.mkString)
   }
 
-  def alternation = concatenation ~ (((cwsp*) ~ "/" ~ (cwsp*) ~ concatenation)*)
-  def concatenation = repetition ~ ((rep1(cwsp) ~ repetition)*)
-  def repetition = (repeat?) ~ element
+  case class Alternation(path: List[Concatenation], precomments: List[List[Option[Comment]]], postcomments: List[List[Option[Comment]]])
+  def alternation: Parser[Alternation] = (concatenation ~ (((cwsp*) ~ "/" ~ (cwsp*) ~ concatenation)*)) ^^ {
+    case c ~ l => Alternation(List(c) ++ l.map(_._2), l.map(_._1._1._1), l.map(_._1._2))
+  }
+
+  case class Concatenation(pieces: List[Repetition], comments: List[List[Option[Comment]]])
+  def concatenation: Parser[Concatenation] = (repetition ~ ((rep1(cwsp) ~ repetition)*)) ^^ {
+    case r ~ reps => Concatenation(List(r) ++ reps.map(_._2), reps.map(_._1))
+
+  }
+
+  case class Repetition(r: Option[Repeat], elem: Element)
+  def repetition: Parser[Repetition] = ((repeat?) ~ element) ^^ {
+    case r ~ elem => Repetition(r, elem)
+  }
 
   case class Repeat(min: Option[NumberVal[DIGIT]], max: Option[NumberVal[DIGIT]])
-  def repeat = (number(digit) | ((number(digit)?) ~ "*" ~ (number(digit)?))) ^^ {
+  def repeat: Parser[Repeat] = (number(digit) | ((number(digit)?) ~ "*" ~ (number(digit)?))) ^^ {
     case a: NumberVal[DIGIT] => Repeat(Some(a), Some(a))
-    case (min: NumberVal[DIGIT]) ~ _ ~ (max: NumberVal[DIGIT]) => Repeat(Some(min), Some(max))
+    case (min: Option[NumberVal[DIGIT]]) ~ _ ~ (max: Option[NumberVal[DIGIT]]) => Repeat(min, max)
   }
 
   sealed trait Element
-  def element = rulename | group | option | char_val | num_val | prose_val
-  def group = "(" ~ (cwsp*) ~ alternation ~ (cwsp*) ~ ")"
-  def option = "[" ~ (cwsp*) ~ alternation ~ (cwsp*) ~ "]"
+  def element: Parser[Element] = rulename | group | option | char_val | num_val | prose_val
 
-  def CharVal(c: List[String])
-  def char_val = DQUOTE ~ (("[\u0020-\u0021]".r | "[\u0023-\u007E]".r)*) ~ DQUOTE ^^ {
+  case class Group(alternation: Alternation) extends Element
+  def group: Parser[Group] = ("(" ~ (cwsp*) ~ alternation ~ (cwsp*) ~ ")") ^^ {
+    case _ ~_ ~ alt ~ _ ~ _ => Group(alt)
+  }
+
+  case class Opt(alternation: Alternation) extends Element
+  def option: Parser[Opt] = "[" ~ (cwsp*) ~ alternation ~ (cwsp*) ~ "]" ^^ {
+    case _ ~ _ ~ alt ~ _ ~ _ => Opt(alt)
+  }
+
+  case class CharVal(c: List[String]) extends Element
+  def char_val: Parser[CharVal] = DQUOTE ~ (("[\u0020-\u0021]".r | "[\u0023-\u007E]".r)*) ~ DQUOTE ^^ {
     case _ ~ s ~ _ => CharVal(s)
   }
 
-  case class NumberVal[T](d: List[T])
+  case class NumberVal[T](d: List[T]) extends Element
   def number[T](of: Parser[T]): Parser[NumberVal[T]] = rep1(of) ^^ (l => NumberVal(l))
 
-  case class Range[T](start: NumberVal[T], end: Option[NumberVal[T]])
+  case class Range[T](start: NumberVal[T], end: NumberVal[T])
   def range[T](of: Parser[T]): Parser[Range[T]] = number(of) ~ (("-" ~ number(of))?) ^^ {
-    case s ~ None => Range(s, None)
-    case s ~ Some(_ ~ e) => Range(s, Some(e))
+    case s ~ None => Range(s, s)
+    case s ~ Some(_ ~ e) => Range(s, e)
   }
 
   case class ConcatenatedRanges[T](ranges: List[Range[T]])
@@ -81,6 +115,6 @@ object ABNF extends ABNFCore {
   case class HexVal(r: ConcatenatedRanges[HEXDIG]) extends NumVal
   def hex_val = "x" ~ ranges(hexdig) ^^ { case _ ~ h => HexVal(h) }
 
-  case class ProseVal(value: List[String])
-  def prose_val = "<" ~ (("[\u0020-\u003D]".r | "[\u003F-\u007E]".r)*) ~ ">" ^^ { case _ ~ x ~ _ => ProseVal(x) }
+  case class ProseVal(value: List[String]) extends Element
+  def prose_val: Parser[ProseVal] = "<" ~ (("[\u0020-\u003D]".r | "[\u003F-\u007E]".r)*) ~ ">" ^^ { case _ ~ x ~ _ => ProseVal(x) }
 }
